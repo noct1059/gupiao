@@ -76,7 +76,90 @@ def _format_records(title: str, rows: list[dict[str, Any]], columns: list[tuple[
     return "\n".join(lines) + "\n"
 
 
-def collect_akshare_snapshot() -> str:
+def _as_float(value: Any) -> float | None:
+    try:
+        if value in (None, "", "-", "--"):
+            return None
+        return float(str(value).replace("%", "").replace(",", ""))
+    except Exception:
+        return None
+
+
+def _amount_yi(value: Any) -> str:
+    number = _as_float(value)
+    if number is None:
+        return str(value or "")
+    return f"{number / 100000000:.1f}亿"
+
+
+def _summarize_breadth(spot: Any) -> str:
+    try:
+        pct_col = "涨跌幅"
+        amount_col = "成交额"
+        if pct_col not in spot.columns:
+            return "### 全市场温度\n缺少涨跌幅字段，无法统计涨跌家数。\n"
+
+        pct = spot[pct_col].apply(_as_float)
+        up_count = int((pct > 0).sum())
+        down_count = int((pct < 0).sum())
+        flat_count = int((pct == 0).sum())
+        strong_count = int((pct >= 5).sum())
+        weak_count = int((pct <= -5).sum())
+        total_count = int(pct.notna().sum())
+
+        lines = [
+            "### 全市场温度",
+            f"- 股票覆盖数：{total_count}",
+            f"- 上涨/下跌/平盘：{up_count}/{down_count}/{flat_count}",
+            f"- 涨幅>=5% / 跌幅<=-5%：{strong_count}/{weak_count}",
+        ]
+        if amount_col in spot.columns:
+            amount = spot[amount_col].apply(_as_float).dropna().sum()
+            lines.append(f"- 全市场成交额估算：{_amount_yi(amount)}")
+        return "\n".join(lines) + "\n"
+    except Exception as exc:
+        return f"### 全市场温度\n获取失败：{exc}\n"
+
+
+def _collect_index_snapshot(ak: Any) -> str:
+    try:
+        index_df = ak.stock_zh_index_spot_em()
+        wanted = {"上证指数", "深证成指", "创业板指", "科创50", "沪深300", "中证500", "中证1000"}
+        rows = []
+        for row in index_df.fillna("").to_dict("records"):
+            name = str(_pick(row, ["名称", "name"]))
+            code = str(_pick(row, ["代码", "code"]))
+            if name in wanted or code in {"000001", "399001", "399006", "000688", "000300", "000905", "000852"}:
+                rows.append(row)
+        if not rows:
+            rows = _safe_head(index_df, 8)
+        return _format_records(
+            "核心指数快照",
+            rows,
+            [
+                ("代码", ["代码", "code"]),
+                ("名称", ["名称", "name"]),
+                ("最新", ["最新价", "最新"]),
+                ("涨跌幅", ["涨跌幅"]),
+                ("成交额", ["成交额"]),
+                ("振幅", ["振幅"]),
+            ],
+        )
+    except Exception as exc:
+        return f"### 核心指数快照\n获取失败：{exc}\n"
+
+
+def _collect_external_context(mode: PlanMode, search_context_hint: str = "") -> str:
+    label = "盘前重点" if mode.key == "pre-market" else "外部环境"
+    return (
+        f"### {label}\n"
+        "- 外围指数、人民币汇率、商品期货暂由新闻搜索结果辅助判断。\n"
+        "- 如果搜索结果不足，请在结论中明确写“外部环境信号不足”，不要硬推断。\n"
+        f"- 当前模式：{mode.title}。{search_context_hint}\n"
+    )
+
+
+def collect_akshare_snapshot(mode: PlanMode) -> str:
     """Collect optional A-share breadth, hot stock, sector and fund-flow data."""
     blocks: list[str] = []
     try:
@@ -84,8 +167,13 @@ def collect_akshare_snapshot() -> str:
     except Exception as exc:
         return f"AkShare 不可用：{exc}"
 
+    blocks.append(_collect_external_context(mode))
+    blocks.append(_collect_index_snapshot(ak))
+
+    spot = None
     try:
         spot = ak.stock_zh_a_spot_em()
+        blocks.append(_summarize_breadth(spot))
         rows = _safe_head(_sort_by(spot, "涨跌幅"), 10)
         blocks.append(
             _format_records(
@@ -100,8 +188,23 @@ def collect_akshare_snapshot() -> str:
                 ],
             )
         )
+
+        rows = _safe_head(_sort_by(spot, "成交额"), 10)
+        blocks.append(
+            _format_records(
+                "成交额前列股票",
+                rows,
+                [
+                    ("代码", ["代码", "code"]),
+                    ("名称", ["名称", "name"]),
+                    ("涨跌幅", ["涨跌幅"]),
+                    ("成交额", ["成交额"]),
+                    ("换手", ["换手率"]),
+                ],
+            )
+        )
     except Exception as exc:
-        blocks.append(f"### 热门股票/涨幅前列\n获取失败：{exc}\n")
+        blocks.append(f"### 全市场股票快照\n获取失败：{exc}\n")
 
     try:
         industry = ak.stock_board_industry_name_em()
@@ -178,7 +281,11 @@ def collect_akshare_snapshot() -> str:
             )
         )
     except Exception as exc:
-        blocks.append(f"### 涨停池\n获取失败：{exc}\n")
+        blocks.append(
+            "### 涨停池\n"
+            f"获取失败：{exc}\n"
+            "提示：非交易日或接口临时不可用时，涨停池可能为空。\n"
+        )
 
     return "\n".join(blocks)
 
@@ -191,9 +298,15 @@ def build_search_context(mode: PlanMode, search_service: Any) -> str:
         "A股 今日 盘面 热点 板块 资金流向",
         "A股 今日 涨停 跌停 连板 热点 题材",
         "A股 今日 政策 消息 产业 催化",
+        "今日 上证指数 深证成指 创业板指 成交额 涨跌家数",
     ]
     if mode.key == "pre-market":
-        queries.append("A股 今日 盘前 外围市场 人民币 商品 政策")
+        queries.extend(
+            [
+                "A股 今日 盘前 外围市场 人民币 商品 政策",
+                "隔夜 美股 港股 A50 人民币 原油 黄金 对A股影响",
+            ]
+        )
     elif mode.key in {"midday", "afternoon"}:
         queries.append("A股 盘中 主力资金 热门股票 板块异动")
     else:
@@ -220,6 +333,10 @@ def build_search_context(mode: PlanMode, search_service: Any) -> str:
 
 
 def build_prompt(mode: PlanMode, stock_list: str, market_data: str, search_context: str) -> str:
+    now = datetime.now()
+    weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    weekday = weekday_names[now.weekday()]
+    trading_day_note = "非交易日，盘面数据可能来自最近一个交易日" if now.weekday() >= 5 else "交易日"
     common_rules = """
 你是一个偏交易计划型的 A 股复盘助手。请严格遵守：
 1. 不给绝对买卖建议，不说必涨必跌，不鼓励追高。
@@ -227,6 +344,9 @@ def build_prompt(mode: PlanMode, stock_list: str, market_data: str, search_conte
 3. 输出要短、清楚、可验证，避免泛泛而谈。
 4. 对个股只给：观察角色、确认信号、失效信号、风险等级。
 5. 如果数据缺失，明确写“数据缺失，不作为判断依据”。
+6. 优先使用“核心指数快照、全市场温度、行业资金流向、热门板块、涨停池、成交额前列股票”这些硬数据。
+7. 非交易日或数据源失败时，要区分“市场本身无交易”和“接口获取失败”，不要把缺失数据当成利空。
+8. 严禁编造日期、指数点位、成交额、涨停数量、新闻事件；没有数据就写缺失。
 """
 
     mode_instructions = {
@@ -270,6 +390,7 @@ def build_prompt(mode: PlanMode, stock_list: str, market_data: str, search_conte
 
     return f"""{common_rules}
 
+当前日期：{now.strftime("%Y-%m-%d")}（{weekday}，{trading_day_note}）
 当前任务：{mode.title}
 任务目标：{mode.objective}
 自选股：{stock_list}
@@ -304,7 +425,7 @@ def main() -> int:
     if analyzer is None:
         analyzer = GeminiAnalyzer(config=config)
 
-    market_data = collect_akshare_snapshot()
+    market_data = collect_akshare_snapshot(mode)
     search_context = build_search_context(mode, search_service)
     prompt = build_prompt(mode, stock_list, market_data, search_context)
 
