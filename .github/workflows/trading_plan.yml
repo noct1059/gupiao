@@ -1,0 +1,98 @@
+name: A股交易计划
+
+on:
+  schedule:
+    # Beijing 08:40, Monday-Friday
+    - cron: "40 0 * * 1-5"
+    # Beijing 17:30, Monday-Friday
+    - cron: "30 9 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "计划类型"
+        required: true
+        default: "pre-market"
+        type: choice
+        options:
+          - pre-market
+          - midday
+          - afternoon
+          - post-market
+      no_notify:
+        description: "只生成不推送"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: trading-plan-${{ github.event.inputs.mode || github.event.schedule }}
+  cancel-in-progress: false
+
+jobs:
+  trading-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Resolve plan mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ github.event.inputs.mode }}"
+          elif [ "${{ github.event.schedule }}" = "40 0 * * 1-5" ]; then
+            MODE="pre-market"
+          elif [ "${{ github.event.schedule }}" = "30 9 * * 1-5" ]; then
+            MODE="post-market"
+          else
+            MODE="pre-market"
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+      - name: Generate trading plan
+        env:
+          STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
+          LLM_CHANNELS: ${{ vars.LLM_CHANNELS || secrets.LLM_CHANNELS }}
+          LLM_DEEPSEEK_PROTOCOL: ${{ vars.LLM_DEEPSEEK_PROTOCOL || secrets.LLM_DEEPSEEK_PROTOCOL }}
+          LLM_DEEPSEEK_BASE_URL: ${{ vars.LLM_DEEPSEEK_BASE_URL || secrets.LLM_DEEPSEEK_BASE_URL }}
+          LLM_DEEPSEEK_API_KEY: ${{ secrets.LLM_DEEPSEEK_API_KEY }}
+          LLM_DEEPSEEK_MODELS: ${{ vars.LLM_DEEPSEEK_MODELS || secrets.LLM_DEEPSEEK_MODELS }}
+          LITELLM_MODEL: ${{ vars.LITELLM_MODEL || secrets.LITELLM_MODEL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          BOCHA_API_KEYS: ${{ secrets.BOCHA_API_KEYS }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+          FEISHU_WEBHOOK_KEYWORD: ${{ vars.FEISHU_WEBHOOK_KEYWORD || secrets.FEISHU_WEBHOOK_KEYWORD }}
+          REPORT_LANGUAGE: ${{ vars.REPORT_LANGUAGE || secrets.REPORT_LANGUAGE || 'zh' }}
+          NEWS_STRATEGY_PROFILE: ${{ vars.NEWS_STRATEGY_PROFILE || secrets.NEWS_STRATEGY_PROFILE || 'short' }}
+          NEWS_MAX_AGE_DAYS: ${{ vars.NEWS_MAX_AGE_DAYS || secrets.NEWS_MAX_AGE_DAYS || '3' }}
+          SEARXNG_PUBLIC_INSTANCES_ENABLED: "false"
+        run: |
+          ARGS="--mode ${{ steps.mode.outputs.mode }}"
+          if [ "${{ github.event.inputs.no_notify }}" = "true" ]; then
+            ARGS="$ARGS --no-notify"
+          fi
+          python scripts/trading_plan.py $ARGS
+
+      - name: Upload trading plan artifacts
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: trading-plan-${{ steps.mode.outputs.mode }}-${{ github.run_number }}
+          path: |
+            reports/
+            logs/
+          retention-days: 30
