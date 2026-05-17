@@ -31,12 +31,27 @@ const HomePage: React.FC = () => {
   const [marketReviewReport, setMarketReviewReport] = useState<string | null>(null);
   const [marketReviewReportCopied, setMarketReviewReportCopied] = useState(false);
   const marketReviewPollTimer = useRef<number | null>(null);
+  const dashboardScrollRef = useRef<HTMLElement | null>(null);
 
   const stopMarketReviewPolling = useCallback(() => {
     if (marketReviewPollTimer.current !== null) {
       window.clearInterval(marketReviewPollTimer.current);
       marketReviewPollTimer.current = null;
     }
+  }, []);
+
+  const scrollMarketReviewFeedbackIntoView = useCallback(() => {
+    const scrollContainer = dashboardScrollRef.current;
+    if (!scrollContainer) {
+      return;
+    }
+
+    if (typeof scrollContainer.scrollTo === 'function') {
+      scrollContainer.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+
+    scrollContainer.scrollTop = 0;
   }, []);
 
   useEffect(() => stopMarketReviewPolling, [stopMarketReviewPolling]);
@@ -104,6 +119,7 @@ const HomePage: React.FC = () => {
 
   const reportLanguage = normalizeReportLanguage(selectedReport?.meta.reportLanguage);
   const reportText = getReportText(reportLanguage);
+  const isMarketReviewHistoryReport = selectedReport?.meta.reportType === 'market_review';
   const setupNeedsAction = setupStatus ? !setupStatus.isComplete : false;
   const setupMissingLabels = useMemo(() => {
     if (!setupStatus) {
@@ -146,7 +162,7 @@ const HomePage: React.FC = () => {
   );
 
   const handleAskFollowUp = useCallback(() => {
-    if (selectedReport?.meta.id === undefined) {
+    if (selectedReport?.meta.id === undefined || selectedReport.meta.reportType === 'market_review') {
       return;
     }
 
@@ -157,7 +173,7 @@ const HomePage: React.FC = () => {
   }, [navigate, selectedReport]);
 
   const handleReanalyze = useCallback(() => {
-    if (!selectedReport) {
+    if (!selectedReport || selectedReport.meta.reportType === 'market_review') {
       return;
     }
 
@@ -187,6 +203,7 @@ const HomePage: React.FC = () => {
             title: '大盘复盘已超时',
             message: '任务长时间未返回最终结果，请在任务列表/历史中查看。',
           });
+          scrollMarketReviewFeedbackIntoView();
           return false;
         }
 
@@ -219,6 +236,7 @@ const HomePage: React.FC = () => {
               message: marketReviewText ? '大盘复盘任务已完成，结果如下：' : '大盘复盘任务已完成，结果已生成并按配置推送。',
             });
             setMarketReviewError(null);
+            scrollMarketReviewFeedbackIntoView();
             return false;
           }
 
@@ -237,6 +255,7 @@ const HomePage: React.FC = () => {
               }),
             );
             setMarketReviewNotice(null);
+            scrollMarketReviewFeedbackIntoView();
             return false;
           }
 
@@ -247,6 +266,7 @@ const HomePage: React.FC = () => {
             title: '大盘复盘状态异常',
             message: `收到未知任务状态：${status.status}`,
           });
+          scrollMarketReviewFeedbackIntoView();
           return false;
         } catch (err: unknown) {
           const parsed = getParsedApiError(err);
@@ -255,6 +275,7 @@ const HomePage: React.FC = () => {
             setMarketReviewReport(null);
             setMarketReviewError(parsed);
             setMarketReviewNotice(null);
+            scrollMarketReviewFeedbackIntoView();
             return false;
           }
           return true;
@@ -273,7 +294,7 @@ const HomePage: React.FC = () => {
         }, intervalMs);
       }
     },
-    [stopMarketReviewPolling],
+    [scrollMarketReviewFeedbackIntoView, stopMarketReviewPolling],
   );
 
   const handleTriggerMarketReview = useCallback(async () => {
@@ -281,6 +302,7 @@ const HomePage: React.FC = () => {
     setMarketReviewNotice(null);
     setMarketReviewError(null);
     setMarketReviewReport(null);
+    scrollMarketReviewFeedbackIntoView();
     try {
       const result = await analysisApi.triggerMarketReview({ sendNotification: notify });
       setMarketReviewNotice({
@@ -288,6 +310,7 @@ const HomePage: React.FC = () => {
         title: '大盘复盘已提交',
         message: result.message,
       });
+      scrollMarketReviewFeedbackIntoView();
 
       if (result.taskId) {
         await pollMarketReviewStatus(result.taskId);
@@ -295,10 +318,11 @@ const HomePage: React.FC = () => {
     } catch (err: unknown) {
       setMarketReviewError(getParsedApiError(err));
       setMarketReviewNotice(null);
+      scrollMarketReviewFeedbackIntoView();
     } finally {
       setIsSubmittingMarketReview(false);
     }
-  }, [notify, pollMarketReviewStatus]);
+  }, [notify, pollMarketReviewStatus, scrollMarketReviewFeedbackIntoView]);
 
   const handleCopyMarketReviewReport = useCallback(() => {
     if (!marketReviewReport) {
@@ -479,48 +503,6 @@ const HomePage: React.FC = () => {
           </div>
         ) : null}
 
-        {marketReviewNotice ? (
-          <div className="px-3 pb-2 md:px-4">
-            <InlineAlert
-              variant={marketReviewNotice.variant}
-              title={marketReviewNotice.title}
-              message={marketReviewNotice.message}
-              className="rounded-xl px-3 py-2 text-xs shadow-none"
-            />
-          </div>
-        ) : null}
-
-        {marketReviewError ? (
-          <div className="px-3 pb-2 md:px-4">
-            <ApiErrorAlert
-              error={marketReviewError}
-              className="mb-1"
-              onDismiss={() => setMarketReviewError(null)}
-            />
-          </div>
-        ) : null}
-
-        {marketReviewReport ? (
-          <div className="px-3 pb-2 md:px-4">
-            <div className="rounded-xl border border-subtle bg-surface/70 px-3 py-3 text-xs text-secondary-text shadow-sm">
-              <div className="mb-2 flex items-center justify-between gap-2">
-                <p className="font-semibold text-foreground">大盘复盘报告</p>
-                <button
-                  type="button"
-                  className="home-surface-button h-7 rounded-md px-3 py-1 text-xs text-foreground"
-                  disabled={marketReviewReportCopied}
-                  onClick={() => void handleCopyMarketReviewReport()}
-                >
-                  {marketReviewReportCopied ? '已复制' : '复制'}
-                </button>
-              </div>
-              <pre className="max-h-64 overflow-x-auto overflow-y-auto whitespace-pre-wrap break-words rounded-lg bg-background px-3 py-2 leading-relaxed">
-                {marketReviewReport}
-              </pre>
-            </div>
-          </div>
-        ) : null}
-
         <div className="flex-1 flex min-h-0 overflow-hidden">
           <div className="hidden min-h-0 w-64 shrink-0 flex-col overflow-hidden pl-4 pb-4 md:flex lg:w-72">
             {sidebarContent}
@@ -538,7 +520,54 @@ const HomePage: React.FC = () => {
             </div>
           ) : null}
 
-          <section className="flex-1 min-w-0 min-h-0 overflow-x-auto overflow-y-auto px-3 pb-4 md:px-6 touch-pan-y">
+          <section
+            ref={dashboardScrollRef}
+            data-testid="home-dashboard-scroll"
+            className="flex-1 min-w-0 min-h-0 overflow-x-auto overflow-y-auto px-3 pb-4 md:px-6 touch-pan-y"
+          >
+            {marketReviewNotice ? (
+              <div className="mb-3">
+                <InlineAlert
+                  variant={marketReviewNotice.variant}
+                  title={marketReviewNotice.title}
+                  message={marketReviewNotice.message}
+                  className="rounded-xl px-3 py-2 text-xs shadow-none"
+                />
+              </div>
+            ) : null}
+
+            {marketReviewError ? (
+              <div className="mb-3">
+                <ApiErrorAlert
+                  error={marketReviewError}
+                  className="mb-1"
+                  onDismiss={() => setMarketReviewError(null)}
+                />
+              </div>
+            ) : null}
+
+            {marketReviewReport ? (
+              <div className="mb-3 rounded-xl border border-subtle bg-surface/70 px-3 py-3 text-xs text-secondary-text shadow-sm">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <p className="font-semibold text-foreground">大盘复盘报告</p>
+                  <button
+                    type="button"
+                    className="home-surface-button h-7 rounded-md px-3 py-1 text-xs text-foreground"
+                    disabled={marketReviewReportCopied}
+                    onClick={() => void handleCopyMarketReviewReport()}
+                  >
+                    {marketReviewReportCopied ? '已复制' : '复制'}
+                  </button>
+                </div>
+                <pre
+                  data-testid="market-review-report"
+                  className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-background px-3 py-2 leading-relaxed"
+                >
+                  {marketReviewReport}
+                </pre>
+              </div>
+            ) : null}
+
             {error ? (
               <ApiErrorAlert
                 error={error}
@@ -556,7 +585,7 @@ const HomePage: React.FC = () => {
                   <Button
                     variant="home-action-ai"
                     size="sm"
-                    disabled={isAnalyzing || selectedReport.meta.id === undefined}
+                    disabled={isAnalyzing || selectedReport.meta.id === undefined || isMarketReviewHistoryReport}
                     onClick={handleReanalyze}
                   >
                     <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -567,7 +596,7 @@ const HomePage: React.FC = () => {
                   <Button
                     variant="home-action-ai"
                     size="sm"
-                    disabled={selectedReport.meta.id === undefined}
+                    disabled={selectedReport.meta.id === undefined || isMarketReviewHistoryReport}
                     onClick={handleAskFollowUp}
                   >
                     <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
