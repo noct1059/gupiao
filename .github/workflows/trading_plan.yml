@@ -4,6 +4,10 @@ on:
   schedule:
     # Beijing 08:40, Monday-Friday
     - cron: "40 0 * * 1-5"
+    # Beijing 10:30, Monday-Friday
+    - cron: "30 2 * * 1-5"
+    # Beijing 14:00, Monday-Friday
+    - cron: "0 6 * * 1-5"
     # Beijing 17:30, Monday-Friday
     - cron: "30 9 * * 1-5"
   workflow_dispatch:
@@ -55,6 +59,10 @@ jobs:
             MODE="${{ github.event.inputs.mode }}"
           elif [ "${{ github.event.schedule }}" = "40 0 * * 1-5" ]; then
             MODE="pre-market"
+          elif [ "${{ github.event.schedule }}" = "30 2 * * 1-5" ]; then
+            MODE="midday"
+          elif [ "${{ github.event.schedule }}" = "0 6 * * 1-5" ]; then
+            MODE="afternoon"
           elif [ "${{ github.event.schedule }}" = "30 9 * * 1-5" ]; then
             MODE="post-market"
           else
