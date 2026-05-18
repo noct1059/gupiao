@@ -36,6 +36,8 @@ jobs:
   trading-plan:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      TZ: Asia/Shanghai
 
     steps:
       - name: Checkout

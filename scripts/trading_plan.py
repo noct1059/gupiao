@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,7 @@ if str(ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 load_dotenv(ROOT / ".env")
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -333,7 +335,7 @@ def build_search_context(mode: PlanMode, search_service: Any) -> str:
 
 
 def build_prompt(mode: PlanMode, stock_list: str, market_data: str, search_context: str) -> str:
-    now = datetime.now()
+    now = datetime.now(BEIJING_TZ)
     weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     weekday = weekday_names[now.weekday()]
     trading_day_note = "非交易日，盘面数据可能来自最近一个交易日" if now.weekday() >= 5 else "交易日"
@@ -433,7 +435,7 @@ def main() -> int:
     if not text:
         text = f"【{mode.title}】\n\n生成失败：LLM 未返回内容。请检查 DeepSeek 配置和运行日志。"
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    timestamp = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
     content = f"# {mode.title}（{timestamp}）\n\n{text.strip()}"
     print(content)
 
@@ -445,7 +447,7 @@ def main() -> int:
 
     reports_dir = ROOT / "reports"
     reports_dir.mkdir(exist_ok=True)
-    out = reports_dir / f"trading_plan_{mode.key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    out = reports_dir / f"trading_plan_{mode.key}_{datetime.now(BEIJING_TZ).strftime('%Y%m%d_%H%M%S')}.md"
     out.write_text(content, encoding="utf-8")
     return 0
 
