@@ -55,6 +55,11 @@ def _sort_by(df: Any, column: str, ascending: bool = False) -> Any:
     return df
 
 
+def _sort_by_first(df: Any, columns: Iterable[str], ascending: bool = False) -> Any:
+    column = _first_existing_column(df, columns)
+    return _sort_by(df, column, ascending=ascending) if column else df
+
+
 def _pick(row: dict[str, Any], names: Iterable[str], default: Any = "") -> Any:
     for name in names:
         if name in row and row[name] not in (None, ""):
@@ -94,10 +99,20 @@ def _amount_yi(value: Any) -> str:
     return f"{number / 100000000:.1f}亿"
 
 
+def _first_existing_column(df: Any, names: Iterable[str]) -> str | None:
+    try:
+        for name in names:
+            if name in df.columns:
+                return name
+    except Exception:
+        pass
+    return None
+
+
 def _summarize_breadth(spot: Any) -> str:
     try:
         pct_col = "涨跌幅"
-        amount_col = "成交额"
+        amount_col = _first_existing_column(spot, ["成交额", "成交金额"])
         if pct_col not in spot.columns:
             return "### 全市场温度\n缺少涨跌幅字段，无法统计涨跌家数。\n"
 
@@ -115,7 +130,7 @@ def _summarize_breadth(spot: Any) -> str:
             f"- 上涨/下跌/平盘：{up_count}/{down_count}/{flat_count}",
             f"- 涨幅>=5% / 跌幅<=-5%：{strong_count}/{weak_count}",
         ]
-        if amount_col in spot.columns:
+        if amount_col:
             amount = spot[amount_col].apply(_as_float).dropna().sum()
             lines.append(f"- 全市场成交额估算：{_amount_yi(amount)}")
         return "\n".join(lines) + "\n"
@@ -123,9 +138,19 @@ def _summarize_breadth(spot: Any) -> str:
         return f"### 全市场温度\n获取失败：{exc}\n"
 
 
+def _get_today_zt_pool(ak: Any) -> Any:
+    today = datetime.now(BEIJING_TZ).strftime("%Y%m%d")
+    return ak.stock_zt_pool_em(date=today)
+
+
 def _collect_index_snapshot(ak: Any) -> str:
     try:
-        index_df = ak.stock_zh_index_spot_em()
+        source_note = "东方财富"
+        try:
+            index_df = ak.stock_zh_index_spot_em()
+        except Exception as primary_exc:
+            index_df = ak.stock_zh_index_spot_sina()
+            source_note = f"新浪备用（东方财富失败：{primary_exc}）"
         wanted = {"上证指数", "深证成指", "创业板指", "科创50", "沪深300", "中证500", "中证1000"}
         rows = []
         for row in index_df.fillna("").to_dict("records"):
@@ -135,7 +160,7 @@ def _collect_index_snapshot(ak: Any) -> str:
                 rows.append(row)
         if not rows:
             rows = _safe_head(index_df, 8)
-        return _format_records(
+        return f"### 数据源说明\n核心指数快照来源：{source_note}\n\n" + _format_records(
             "核心指数快照",
             rows,
             [
@@ -143,7 +168,7 @@ def _collect_index_snapshot(ak: Any) -> str:
                 ("名称", ["名称", "name"]),
                 ("最新", ["最新价", "最新"]),
                 ("涨跌幅", ["涨跌幅"]),
-                ("成交额", ["成交额"]),
+                ("成交额", ["成交额", "成交金额"]),
                 ("振幅", ["振幅"]),
             ],
         )
@@ -174,7 +199,13 @@ def collect_akshare_snapshot(mode: PlanMode) -> str:
 
     spot = None
     try:
-        spot = ak.stock_zh_a_spot_em()
+        spot_source = "东方财富"
+        try:
+            spot = ak.stock_zh_a_spot_em()
+        except Exception as primary_exc:
+            spot = ak.stock_zh_a_spot()
+            spot_source = f"新浪备用（东方财富失败：{primary_exc}）"
+        blocks.append(f"### 数据源说明\n全市场股票快照来源：{spot_source}\n")
         blocks.append(_summarize_breadth(spot))
         rows = _safe_head(_sort_by(spot, "涨跌幅"), 10)
         blocks.append(
@@ -191,7 +222,7 @@ def collect_akshare_snapshot(mode: PlanMode) -> str:
             )
         )
 
-        rows = _safe_head(_sort_by(spot, "成交额"), 10)
+        rows = _safe_head(_sort_by_first(spot, ["成交额", "成交金额"]), 10)
         blocks.append(
             _format_records(
                 "成交额前列股票",
@@ -200,7 +231,7 @@ def collect_akshare_snapshot(mode: PlanMode) -> str:
                     ("代码", ["代码", "code"]),
                     ("名称", ["名称", "name"]),
                     ("涨跌幅", ["涨跌幅"]),
-                    ("成交额", ["成交额"]),
+                    ("成交额", ["成交额", "成交金额"]),
                     ("换手", ["换手率"]),
                 ],
             )
@@ -225,7 +256,36 @@ def collect_akshare_snapshot(mode: PlanMode) -> str:
             )
         )
     except Exception as exc:
-        blocks.append(f"### 热门行业板块\n获取失败：{exc}\n")
+        try:
+            zt_pool_for_industry = _get_today_zt_pool(ak)
+            industry_col = _first_existing_column(zt_pool_for_industry, ["所属行业"])
+            if industry_col:
+                grouped = (
+                    zt_pool_for_industry[industry_col]
+                    .fillna("")
+                    .astype(str)
+                    .replace("", "未分类")
+                    .value_counts()
+                    .head(8)
+                    .reset_index()
+                )
+                grouped.columns = ["行业", "涨停家数"]
+                blocks.append(
+                    "### 热门行业板块（降级：涨停池行业分布）\n"
+                    f"主板块接口获取失败：{exc}\n"
+                    + _format_records(
+                        "涨停行业分布",
+                        grouped.to_dict("records"),
+                        [
+                            ("行业", ["行业"]),
+                            ("涨停家数", ["涨停家数"]),
+                        ],
+                    )
+                )
+            else:
+                blocks.append(f"### 热门行业板块\n获取失败：{exc}\n")
+        except Exception as fallback_exc:
+            blocks.append(f"### 热门行业板块\n获取失败：{exc}；涨停池行业降级也失败：{fallback_exc}\n")
 
     try:
         concept = ak.stock_board_concept_name_em()
@@ -265,8 +325,7 @@ def collect_akshare_snapshot(mode: PlanMode) -> str:
         blocks.append(f"### 行业资金流向\n获取失败：{exc}\n")
 
     try:
-        today = datetime.now().strftime("%Y%m%d")
-        zt_pool = ak.stock_zt_pool_em(date=today)
+        zt_pool = _get_today_zt_pool(ak)
         rows = _safe_head(zt_pool, 12)
         blocks.append(
             _format_records(
