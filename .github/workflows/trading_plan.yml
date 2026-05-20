@@ -1,15 +1,6 @@
 name: A股交易计划
 
 on:
-  schedule:
-    # Beijing 08:40, Monday-Friday
-    - cron: "40 0 * * 1-5"
-    # Beijing 10:30, Monday-Friday
-    - cron: "30 2 * * 1-5"
-    # Beijing 14:00, Monday-Friday
-    - cron: "0 6 * * 1-5"
-    # Beijing 17:30, Monday-Friday
-    - cron: "30 9 * * 1-5"
   workflow_dispatch:
     inputs:
       mode:

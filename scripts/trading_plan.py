@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -83,6 +84,13 @@ def _format_records(title: str, rows: list[dict[str, Any]], columns: list[tuple[
     return "\n".join(lines) + "\n"
 
 
+def _format_optional_number(value: Any, suffix: str = "") -> str:
+    number = _as_float(value)
+    if number is None:
+        return str(value or "缺失")
+    return f"{number:.2f}{suffix}"
+
+
 def _as_float(value: Any) -> float | None:
     try:
         if value in (None, "", "-", "--"):
@@ -143,6 +151,69 @@ def _get_today_zt_pool(ak: Any) -> Any:
     return ak.stock_zt_pool_em(date=today)
 
 
+def _parse_stock_codes(stock_list: str) -> list[str]:
+    seen: set[str] = set()
+    codes: list[str] = []
+    for token in re.split(r"[,，\s;；]+", stock_list or ""):
+        match = re.search(r"\d{6}", token)
+        if not match:
+            continue
+        code = match.group(0)
+        if code not in seen:
+            seen.add(code)
+            codes.append(code)
+    return codes
+
+
+def _collect_watchlist_snapshot(stock_list: str) -> str:
+    codes = _parse_stock_codes(stock_list)
+    if not codes:
+        return "### 自选股实时快照\n未配置自选股代码。\n"
+
+    try:
+        from data_provider.akshare_fetcher import AkshareFetcher
+    except Exception as exc:
+        return f"### 自选股实时快照\n获取失败：AkshareFetcher 不可用：{exc}\n"
+
+    fetcher = AkshareFetcher()
+    lines = [
+        "### 自选股实时快照",
+        f"- 快照时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')} 北京时间",
+        "- 说明：个股涨跌以本表为准；若本表缺失，不要编造个股涨跌幅。",
+    ]
+    for code in codes:
+        quote = None
+        errors: list[str] = []
+        for source in ("tencent", "sina", "em"):
+            try:
+                quote = fetcher.get_realtime_quote(code, source=source)
+                if quote:
+                    break
+                errors.append(f"{source}: 空")
+            except Exception as exc:
+                errors.append(f"{source}: {type(exc).__name__}")
+
+        if quote:
+            source_name = getattr(getattr(quote, "source", None), "value", None) or str(getattr(quote, "source", ""))
+            lines.append(
+                "- "
+                + " | ".join(
+                    [
+                        f"代码:{code}",
+                        f"名称:{quote.name or '缺失'}",
+                        f"最新价:{_format_optional_number(quote.price)}",
+                        f"涨跌幅:{_format_optional_number(quote.change_pct, '%')}",
+                        f"涨跌额:{_format_optional_number(quote.change_amount)}",
+                        f"成交额:{_amount_yi(quote.amount) if quote.amount is not None else '缺失'}",
+                        f"来源:{source_name}",
+                    ]
+                )
+            )
+        else:
+            lines.append(f"- 代码:{code} | 获取失败：{'；'.join(errors[-3:])}")
+    return "\n".join(lines) + "\n"
+
+
 def _collect_index_snapshot(ak: Any) -> str:
     try:
         source_note = "东方财富"
@@ -186,7 +257,7 @@ def _collect_external_context(mode: PlanMode, search_context_hint: str = "") -> 
     )
 
 
-def collect_akshare_snapshot(mode: PlanMode) -> str:
+def collect_akshare_snapshot(mode: PlanMode, stock_list: str = "") -> str:
     """Collect optional A-share breadth, hot stock, sector and fund-flow data."""
     blocks: list[str] = []
     try:
@@ -195,6 +266,7 @@ def collect_akshare_snapshot(mode: PlanMode) -> str:
         return f"AkShare 不可用：{exc}"
 
     blocks.append(_collect_external_context(mode))
+    blocks.append(_collect_watchlist_snapshot(stock_list))
     blocks.append(_collect_index_snapshot(ak))
 
     spot = None
@@ -486,7 +558,7 @@ def main() -> int:
     if analyzer is None:
         analyzer = GeminiAnalyzer(config=config)
 
-    market_data = collect_akshare_snapshot(mode)
+    market_data = collect_akshare_snapshot(mode, stock_list)
     search_context = build_search_context(mode, search_service)
     prompt = build_prompt(mode, stock_list, market_data, search_context)
 
