@@ -42,10 +42,12 @@ jobs:
           from pathlib import Path
           path = Path("/tmp/TradingAgents-astock/pyproject.toml")
           text = path.read_text(encoding="utf-8")
-          text = text.replace(
-              'Upstream = "https://github.com/TauricResearch/TradingAgents"\ndependencies = [',
-              'Upstream = "https://github.com/TauricResearch/TradingAgents"\n\n[project]\ndependencies = [',
-          )
+          dep_start = text.index("\ndependencies = [") + 1
+          dep_end = text.index("\n\n[project.optional-dependencies]", dep_start)
+          dep_block = text[dep_start:dep_end]
+          text = text[:dep_start] + text[dep_end:]
+          project_urls_start = text.index("\n[project.urls]")
+          text = text[:project_urls_start] + "\n" + dep_block + "\n" + text[project_urls_start:]
           path.write_text(text, encoding="utf-8")
           PY
           pip install /tmp/TradingAgents-astock
