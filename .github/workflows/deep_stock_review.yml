@@ -44,7 +44,7 @@ jobs:
           text = path.read_text(encoding="utf-8")
           text = text.replace(
               'Upstream = "https://github.com/TauricResearch/TradingAgents"\ndependencies = [',
-              'Upstream = "https://github.com/TauricResearch/TradingAgents"\n\ndependencies = [',
+              'Upstream = "https://github.com/TauricResearch/TradingAgents"\n\n[project]\ndependencies = [',
           )
           path.write_text(text, encoding="utf-8")
           PY
