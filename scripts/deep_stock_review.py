@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Run a nightly single-stock TradingAgents-Astock deep review and push it to Feishu."""
+"""Run a single-stock TradingAgents-Astock review and push a candidate-screening brief to Feishu."""
 
 from __future__ import annotations
 
@@ -101,6 +101,88 @@ def _trim_report(text: str, max_chars: int = 15000) -> str:
     return text[:max_chars] + "\n\n[内容过长，已截断；完整报告见 GitHub Actions artifact。]"
 
 
+def _deepseek_chat(api_key: str, model: str, prompt: str) -> str:
+    base_url = os.getenv("LLM_DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+    resp = requests.post(
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是严谨的A股备选池初筛助手。只根据用户给出的研报内容判断，不新增不存在的数据。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": float(os.getenv("DEEP_REVIEW_SCREENING_TEMPERATURE", "0.2")),
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    return (body.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+
+
+def _build_screening_brief(stock_code: str, trade_date: str, report: str, fallback_model: str) -> str:
+    api_key = (
+        os.getenv("DEEPSEEK_API_KEY", "").strip()
+        or os.getenv("LLM_DEEPSEEK_API_KEY", "").strip()
+        or os.getenv("DEEPSEEK_API_KEYS", "").split(",", 1)[0].strip()
+    )
+    if not api_key:
+        return ""
+
+    model = (
+        os.getenv("DEEP_REVIEW_SCREENING_MODEL", "").strip()
+        or os.getenv("DEEP_REVIEW_DEEP_MODEL", "").strip()
+        or fallback_model
+    )
+    prompt = f"""请根据下面这份A股深度投研报告，输出一个适合飞书快速阅读的“备选池初筛结论”。
+
+要求：
+1. 不要复述全文，先给结论。
+2. 只能使用报告里已经出现的信息，不要编造缺失数据。
+3. 如果报告证据不足，要明确写“继续观察”或“暂不加入”，不要为了给答案而强行看多。
+4. 结论只允许三选一：加入备选 / 继续观察 / 暂不加入。
+5. 输出中文 Markdown。
+
+固定格式：
+# 个股备选池初筛
+- 股票代码：{stock_code}
+- 分析日期：{trade_date}
+- 结论：加入备选 / 继续观察 / 暂不加入
+- 置信度：高 / 中 / 低
+- 适合类型：趋势 / 成长 / 价值 / 事件 / 防守 / 不适合
+
+## 核心理由
+1.
+2.
+3.
+
+## 主要风险
+1.
+2.
+3.
+
+## 重新评估触发条件
+1.
+2.
+3.
+
+## 下一步观察
+用2-4句话说明接下来应该看什么，适不适合加入自选观察。
+
+深度投研报告：
+{_trim_report(report, max_chars=12000)}
+"""
+    try:
+        return _deepseek_chat(api_key, model, prompt)
+    except Exception as exc:
+        print(f"Screening brief failed: {exc}", file=sys.stderr)
+        return ""
+
+
 def _feishu_sign(secret: str, timestamp: str) -> str:
     key = f"{timestamp}\n{secret}".encode("utf-8")
     digest = hmac.new(key, b"", digestmod=hashlib.sha256).digest()
@@ -166,14 +248,19 @@ def main() -> int:
         elapsed = time.time() - started
 
         decision = final_state.get("final_trade_decision", "") or str(signal)
-        content = (
-            f"# A股盘后深度复盘（{trade_date}）\n\n"
+        raw_report = decision.strip()
+        screening_brief = _build_screening_brief(stock_code, trade_date, raw_report, deep_model)
+        header = (
+            f"# A股个股备选筛选（{trade_date}）\n\n"
             f"- 股票代码：{stock_code}\n"
             f"- 模型：{provider} / quick={quick_model} / deep={deep_model}\n"
             f"- 耗时：{elapsed / 60:.1f} 分钟\n"
-            f"- 信号：{signal}\n\n"
-            f"{decision.strip()}"
+            f"- 原始信号：{signal}\n"
         )
+        if screening_brief:
+            content = f"{header}\n{screening_brief.strip()}\n\n---\n\n## 原始深度报告\n\n{raw_report}"
+        else:
+            content = f"{header}\n## 原始深度报告\n\n{raw_report}"
 
         out_path = reports_dir / f"deep_review_{stock_code}_{trade_date}.md"
         out_path.write_text(content, encoding="utf-8")
