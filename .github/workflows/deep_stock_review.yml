@@ -37,7 +37,18 @@ jobs:
       - name: Install TradingAgents-Astock
         run: |
           pip install --upgrade pip
-          pip install "git+https://github.com/simonlin1212/TradingAgents-astock.git"
+          git clone --depth 1 https://github.com/simonlin1212/TradingAgents-astock.git /tmp/TradingAgents-astock
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("/tmp/TradingAgents-astock/pyproject.toml")
+          text = path.read_text(encoding="utf-8")
+          text = text.replace(
+              'Upstream = "https://github.com/TauricResearch/TradingAgents"\ndependencies = [',
+              'Upstream = "https://github.com/TauricResearch/TradingAgents"\n\ndependencies = [',
+          )
+          path.write_text(text, encoding="utf-8")
+          PY
+          pip install /tmp/TradingAgents-astock
 
       - name: Run deep stock review
         env:
