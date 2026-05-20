@@ -44,16 +44,16 @@ def _parse_stock_codes(stock_list: str) -> list[str]:
     return codes
 
 
-def _choose_stock(stock_code: str | None, stock_list: str) -> str:
+def _choose_stocks(stock_code: str | None, stock_list: str) -> list[str]:
     if stock_code:
-        match = re.search(r"\d{6}", stock_code)
-        if match:
-            return match.group(0)
+        codes = _parse_stock_codes(stock_code)
+        if codes:
+            return codes
     codes = _parse_stock_codes(stock_list)
     if not codes:
         raise ValueError("No stock code provided and STOCK_LIST is empty.")
     today = datetime.now(BEIJING_TZ)
-    return codes[today.weekday() % len(codes)]
+    return [codes[today.weekday() % len(codes)]]
 
 
 def _build_config(provider: str, quick_model: str, deep_model: str, results_dir: Path) -> dict[str, Any]:
@@ -146,7 +146,7 @@ def main() -> int:
     args = parser.parse_args()
 
     stock_list = os.getenv("STOCK_LIST", "")
-    stock_code = _choose_stock(args.stock_code, stock_list)
+    stock_codes = _choose_stocks(args.stock_code, stock_list)
     trade_date = args.trade_date or datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
     provider = os.getenv("DEEP_REVIEW_LLM_PROVIDER", "deepseek").strip().lower()
     quick_model, deep_model = _select_models(provider)
@@ -158,27 +158,30 @@ def main() -> int:
     results_dir = reports_dir / "tradingagents_logs"
 
     config = _build_config(provider, quick_model, deep_model, results_dir)
-    started = time.time()
-    graph = TradingAgentsGraph(debug=False, config=config)
-    final_state, signal = graph.propagate(stock_code, trade_date)
-    elapsed = time.time() - started
+    all_contents: list[str] = []
+    for stock_code in stock_codes:
+        started = time.time()
+        graph = TradingAgentsGraph(debug=False, config=config)
+        final_state, signal = graph.propagate(stock_code, trade_date)
+        elapsed = time.time() - started
 
-    decision = final_state.get("final_trade_decision", "") or str(signal)
-    content = (
-        f"# A股盘后深度复盘（{trade_date}）\n\n"
-        f"- 股票代码：{stock_code}\n"
-        f"- 模型：{provider} / quick={quick_model} / deep={deep_model}\n"
-        f"- 耗时：{elapsed / 60:.1f} 分钟\n"
-        f"- 信号：{signal}\n\n"
-        f"{decision.strip()}"
-    )
+        decision = final_state.get("final_trade_decision", "") or str(signal)
+        content = (
+            f"# A股盘后深度复盘（{trade_date}）\n\n"
+            f"- 股票代码：{stock_code}\n"
+            f"- 模型：{provider} / quick={quick_model} / deep={deep_model}\n"
+            f"- 耗时：{elapsed / 60:.1f} 分钟\n"
+            f"- 信号：{signal}\n\n"
+            f"{decision.strip()}"
+        )
 
-    out_path = reports_dir / f"deep_review_{stock_code}_{trade_date}.md"
-    out_path.write_text(content, encoding="utf-8")
-    print(content)
-    print(f"\nSaved report: {out_path}")
+        out_path = reports_dir / f"deep_review_{stock_code}_{trade_date}.md"
+        out_path.write_text(content, encoding="utf-8")
+        print(content)
+        print(f"\nSaved report: {out_path}")
+        all_contents.append(content)
 
-    if not args.no_notify and not _send_feishu(content):
+    if not args.no_notify and not _send_feishu("\n\n---\n\n".join(all_contents)):
         return 2
     return 0
 
