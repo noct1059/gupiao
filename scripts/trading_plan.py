@@ -151,10 +151,16 @@ def _get_today_zt_pool(ak: Any) -> Any:
     return ak.stock_zt_pool_em(date=today)
 
 
-def _parse_stock_codes(stock_list: str) -> list[str]:
+def _normalize_stock_list(stock_list: Any) -> str:
+    if isinstance(stock_list, (list, tuple, set)):
+        return ",".join(str(item) for item in stock_list)
+    return str(stock_list or "")
+
+
+def _parse_stock_codes(stock_list: Any) -> list[str]:
     seen: set[str] = set()
     codes: list[str] = []
-    for token in re.split(r"[,，\s;；]+", stock_list or ""):
+    for token in re.split(r"[,，\s;；]+", _normalize_stock_list(stock_list)):
         match = re.search(r"\d{6}", token)
         if not match:
             continue
@@ -165,7 +171,7 @@ def _parse_stock_codes(stock_list: str) -> list[str]:
     return codes
 
 
-def _collect_watchlist_snapshot(stock_list: str) -> str:
+def _collect_watchlist_snapshot(stock_list: Any) -> str:
     codes = _parse_stock_codes(stock_list)
     if not codes:
         return "### 自选股实时快照\n未配置自选股代码。\n"
@@ -257,7 +263,7 @@ def _collect_external_context(mode: PlanMode, search_context_hint: str = "") -> 
     )
 
 
-def collect_akshare_snapshot(mode: PlanMode, stock_list: str = "") -> str:
+def collect_akshare_snapshot(mode: PlanMode, stock_list: Any = "") -> str:
     """Collect optional A-share breadth, hot stock, sector and fund-flow data."""
     blocks: list[str] = []
     try:
@@ -553,7 +559,7 @@ def main() -> int:
     from src.core.market_review_runtime import build_market_review_runtime
 
     config = get_config()
-    stock_list = getattr(config, "stock_list", None) or os.getenv("STOCK_LIST", "")
+    stock_list = _normalize_stock_list(getattr(config, "stock_list", None) or os.getenv("STOCK_LIST", ""))
     notifier, analyzer, search_service = build_market_review_runtime(config)
     if analyzer is None:
         analyzer = GeminiAnalyzer(config=config)
