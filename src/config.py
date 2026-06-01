@@ -31,6 +31,7 @@ from src.notification_noise import (
     parse_notification_quiet_hours,
     validate_notification_timezone,
 )
+from src.llm import generation_params as llm_generation_params
 
 logger = logging.getLogger(__name__)
 
@@ -61,20 +62,6 @@ _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
 # These are compatibility examples; actual availability should be validated by Anspire console/model entitlement.
 ANSPIRE_LLM_BASE_URL_DEFAULT = "https://open-gateway.anspire.cn/v6"
 ANSPIRE_LLM_MODEL_DEFAULT = "Doubao-Seed-2.0-lite"
-# Kimi K2.6 is consumed through Moonshot's OpenAI-compatible API in this
-# repository. Official references:
-# - https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart
-# - https://platform.moonshot.ai/docs/guide/compatibility#parameters-differences-in-request-body
-# - https://huggingface.co/moonshotai/Kimi-K2.6
-# - https://docs.litellm.ai/docs/providers/openai_compatible
-# Only the strict Kimi K2.6 family is normalized here; other models and
-# fallbacks continue using the configured runtime temperature.
-_FIXED_TEMPERATURE_LITELLM_MODELS: Dict[str, Dict[str, float]] = {
-    "kimi-k2.6": {
-        "thinking": 1.0,
-        "non_thinking": 0.6,
-    },
-}
 
 
 def _has_ntfy_topic_endpoint(value: Optional[str]) -> bool:
@@ -109,6 +96,41 @@ NEWS_STRATEGY_WINDOWS: Dict[str, int] = {
     "short": 3,
     "medium": 7,
     "long": 30,
+}
+
+
+@dataclass(frozen=True)
+class AgentContextCompressionPreset:
+    """Preset values for visible chat history compression."""
+
+    trigger_tokens: int
+    protected_turns: int
+    summary_target_tokens: int
+    # P1 reserves this budget for future prompt-size controls; it is not
+    # enforced by the current rolling-summary state table.
+    history_budget_tokens: int
+
+
+AGENT_CONTEXT_COMPRESSION_DEFAULT_PROFILE = "balanced"
+AGENT_CONTEXT_COMPRESSION_PROFILES: Dict[str, AgentContextCompressionPreset] = {
+    "cost": AgentContextCompressionPreset(
+        trigger_tokens=6000,
+        protected_turns=2,
+        summary_target_tokens=900,
+        history_budget_tokens=4000,
+    ),
+    "balanced": AgentContextCompressionPreset(
+        trigger_tokens=12000,
+        protected_turns=4,
+        summary_target_tokens=1500,
+        history_budget_tokens=8000,
+    ),
+    "long_context_raw_first": AgentContextCompressionPreset(
+        trigger_tokens=24000,
+        protected_turns=6,
+        summary_target_tokens=2600,
+        history_budget_tokens=14000,
+    ),
 }
 
 
@@ -223,6 +245,60 @@ def resolve_news_window_days(news_max_age_days: int, news_strategy_profile: Opti
     profile = normalize_news_strategy_profile(news_strategy_profile)
     profile_days = NEWS_STRATEGY_WINDOWS.get(profile, NEWS_STRATEGY_WINDOWS["short"])
     return max(1, min(max(1, int(news_max_age_days)), profile_days))
+
+
+def normalize_agent_context_compression_profile(value: Optional[str]) -> str:
+    """Normalize visible-chat context compression profile values."""
+    candidate = (value or AGENT_CONTEXT_COMPRESSION_DEFAULT_PROFILE).strip().lower()
+    if candidate in AGENT_CONTEXT_COMPRESSION_PROFILES:
+        return candidate
+    logger.warning(
+        "Invalid AGENT_CONTEXT_COMPRESSION_PROFILE=%r; falling back to %s",
+        value,
+        AGENT_CONTEXT_COMPRESSION_DEFAULT_PROFILE,
+    )
+    return AGENT_CONTEXT_COMPRESSION_DEFAULT_PROFILE
+
+
+def get_agent_context_compression_preset(profile: Optional[str]) -> AgentContextCompressionPreset:
+    """Return the preset for a normalized profile, falling back to balanced."""
+    normalized = normalize_agent_context_compression_profile(profile)
+    return AGENT_CONTEXT_COMPRESSION_PROFILES[normalized]
+
+
+def parse_agent_context_compression_int(
+    value: Optional[str],
+    default: int,
+    *,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Parse compression integers; empty/invalid/out-of-range values follow preset defaults."""
+    raw_value = value
+    if raw_value is None or not str(raw_value).strip():
+        return int(default)
+    try:
+        parsed = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not a valid integer; falling back to preset default %s",
+            field_name,
+            raw_value,
+            default,
+        )
+        return int(default)
+    if parsed < minimum or parsed > maximum:
+        logger.warning(
+            "%s=%r is outside supported range [%s, %s]; falling back to preset default %s",
+            field_name,
+            parsed,
+            minimum,
+            maximum,
+            default,
+        )
+        return int(default)
+    return parsed
 
 
 def canonicalize_llm_channel_protocol(value: Optional[str]) -> str:
@@ -350,71 +426,7 @@ def resolve_litellm_wire_model(
     model_list: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Resolve a router alias to its underlying LiteLLM wire model."""
-    normalized_model = (model or "").strip()
-    if not normalized_model or not model_list:
-        return normalized_model
-
-    model_entry = _resolve_litellm_model_list_entry(normalized_model, model_list)
-    if not model_entry:
-        return normalized_model
-
-    params = model_entry.get("litellm_params", {}) or {}
-    wire_model = str(params.get("model") or "").strip()
-    if wire_model:
-        return wire_model
-    return normalized_model
-
-
-def _resolve_litellm_model_list_entry(
-    model: str,
-    model_list: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Return the Router model_list entry matching the configured alias."""
-    normalized_model = (model or "").strip()
-    if not normalized_model or not model_list:
-        return None
-
-    for entry in model_list:
-        model_name = str(entry.get("model_name") or "").strip()
-        if not model_name:
-            params = entry.get("litellm_params", {}) or {}
-            model_name = str(params.get("model") or "").strip()
-        if model_name == normalized_model:
-            return entry
-    return None
-
-
-def _extract_thinking_config(payload: Optional[Dict[str, Any]]) -> Any:
-    """Extract a thinking-mode flag from LiteLLM-style request kwargs."""
-    if not isinstance(payload, dict):
-        return None
-    extra_body = payload.get("extra_body")
-    if isinstance(extra_body, dict) and "thinking" in extra_body:
-        return extra_body.get("thinking")
-    if "thinking" in payload:
-        return payload.get("thinking")
-    return None
-
-
-def _parse_thinking_enabled(value: Any) -> Optional[bool]:
-    """Parse thinking-mode config into True/False/unknown."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"enabled", "enable", "true", "1", "on", "thinking"}:
-            return True
-        if normalized in {"disabled", "disable", "false", "0", "off", "none", "non-thinking", "non_thinking"}:
-            return False
-        return None
-    if isinstance(value, dict):
-        if "enabled" in value:
-            return _parse_thinking_enabled(value.get("enabled"))
-        if "type" in value:
-            return _parse_thinking_enabled(value.get("type"))
-    return None
+    return llm_generation_params.resolve_litellm_wire_model(model, model_list)
 
 
 def resolve_litellm_thinking_enabled(
@@ -423,19 +435,11 @@ def resolve_litellm_thinking_enabled(
     request_overrides: Optional[Dict[str, Any]] = None,
 ) -> Optional[bool]:
     """Resolve whether the outgoing LiteLLM request explicitly enables thinking."""
-    thinking_config = None
-    model_entry = _resolve_litellm_model_list_entry(model, model_list)
-    if model_entry:
-        thinking_config = _extract_thinking_config(model_entry)
-        entry_params = model_entry.get("litellm_params", {}) or {}
-        entry_thinking_config = _extract_thinking_config(entry_params)
-        if entry_thinking_config is not None:
-            thinking_config = entry_thinking_config
-
-    override_thinking_config = _extract_thinking_config(request_overrides)
-    if override_thinking_config is not None:
-        thinking_config = override_thinking_config
-    return _parse_thinking_enabled(thinking_config)
+    return llm_generation_params.resolve_litellm_thinking_enabled(
+        model,
+        model_list=model_list,
+        request_overrides=request_overrides,
+    )
 
 
 def get_fixed_litellm_temperature(
@@ -444,24 +448,11 @@ def get_fixed_litellm_temperature(
     request_overrides: Optional[Dict[str, Any]] = None,
 ) -> Optional[float]:
     """Return a provider-mandated temperature for known strict models."""
-    normalized_model = resolve_litellm_wire_model(model, model_list).lower()
-    if not normalized_model:
-        return None
-    thinking_enabled = resolve_litellm_thinking_enabled(
+    return llm_generation_params.get_fixed_litellm_temperature(
         model,
         model_list=model_list,
         request_overrides=request_overrides,
     )
-    model_parts = [part for part in re.split(r"[/:\s]+", normalized_model) if part]
-    for model_name, temperatures in _FIXED_TEMPERATURE_LITELLM_MODELS.items():
-        if any(part == model_name or part.startswith(f"{model_name}-") for part in model_parts):
-            if thinking_enabled is False and temperatures.get("non_thinking") is not None:
-                return temperatures["non_thinking"]
-            if temperatures.get("thinking") is not None:
-                return temperatures["thinking"]
-            if temperatures.get("non_thinking") is not None:
-                return temperatures["non_thinking"]
-    return None
 
 
 def normalize_litellm_temperature(
@@ -473,16 +464,13 @@ def normalize_litellm_temperature(
     request_overrides: Optional[Dict[str, Any]] = None,
 ) -> float:
     """Normalize temperature before sending a LiteLLM request."""
-    fixed_temperature = get_fixed_litellm_temperature(
+    return llm_generation_params.normalize_litellm_temperature(
         model,
+        temperature,
+        default=default,
         model_list=model_list,
         request_overrides=request_overrides,
     )
-    if fixed_temperature is not None:
-        return fixed_temperature
-    if temperature is None:
-        return default
-    return float(temperature)
 
 
 def resolve_unified_llm_temperature(model: str) -> float:
@@ -632,9 +620,13 @@ class Config:
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
     tickflow_api_key: Optional[str] = None
+    finnhub_api_key: Optional[str] = None
+    alphavantage_api_key: Optional[str] = None
     longbridge_app_key: Optional[str] = None
     longbridge_app_secret: Optional[str] = None
     longbridge_access_token: Optional[str] = None
+    longbridge_oauth_client_id: Optional[str] = None
+    stock_index_remote_update_enabled: bool = True
 
     # === AI 分析配置 ===
     # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-3.1-pro-preview)
@@ -727,6 +719,10 @@ class Config:
     agent_memory_enabled: bool = False  # Enable memory & calibration system
     agent_skill_autoweight: bool = True  # Auto-weight skills by backtest performance
     agent_skill_routing: str = "auto"  # Skill routing: 'auto' (regime-based) or 'manual'
+    agent_context_compression_enabled: bool = False  # Compress visible chat history before Agent calls
+    agent_context_compression_profile: str = AGENT_CONTEXT_COMPRESSION_DEFAULT_PROFILE
+    agent_context_compression_trigger_tokens: int = 12000
+    agent_context_protected_turns: int = 4
     agent_event_monitor_enabled: bool = False  # Enable periodic event-driven alert checks in schedule mode
     agent_event_monitor_interval_minutes: int = 5  # Polling interval for event monitor background checks
     agent_event_alert_rules_json: str = ""  # JSON array of serialized EventMonitor rules
@@ -1025,6 +1021,11 @@ class Config:
                 self.agent_skill_routing, self._VALID_SKILL_ROUTING,
             )
             object.__setattr__(self, "agent_skill_routing", "auto")
+        normalized_profile = normalize_agent_context_compression_profile(
+            self.agent_context_compression_profile
+        )
+        if normalized_profile != self.agent_context_compression_profile:
+            object.__setattr__(self, "agent_context_compression_profile", normalized_profile)
 
     # 单例实例存储
     _instance: Optional['Config'] = None
@@ -1286,6 +1287,26 @@ class Config:
             os.getenv('AGENT_LITELLM_MODEL', ''),
             configured_models=set(get_configured_llm_models(llm_model_list)),
         )
+        agent_context_compression_profile = normalize_agent_context_compression_profile(
+            os.getenv('AGENT_CONTEXT_COMPRESSION_PROFILE')
+        )
+        agent_context_compression_preset = get_agent_context_compression_preset(
+            agent_context_compression_profile
+        )
+        agent_context_compression_trigger_tokens = parse_agent_context_compression_int(
+            os.getenv('AGENT_CONTEXT_COMPRESSION_TRIGGER_TOKENS'),
+            agent_context_compression_preset.trigger_tokens,
+            field_name='AGENT_CONTEXT_COMPRESSION_TRIGGER_TOKENS',
+            minimum=1000,
+            maximum=200000,
+        )
+        agent_context_protected_turns = parse_agent_context_compression_int(
+            os.getenv('AGENT_CONTEXT_PROTECTED_TURNS'),
+            agent_context_compression_preset.protected_turns,
+            field_name='AGENT_CONTEXT_PROTECTED_TURNS',
+            minimum=1,
+            maximum=20,
+        )
 
         # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
         bocha_keys_str = os.getenv('BOCHA_API_KEYS', '')
@@ -1390,9 +1411,16 @@ class Config:
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
+            finnhub_api_key=os.getenv('FINNHUB_API_KEY') or None,
+            alphavantage_api_key=os.getenv('ALPHAVANTAGE_API_KEY') or None,
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
             longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,
             longbridge_access_token=os.getenv('LONGBRIDGE_ACCESS_TOKEN') or None,
+            longbridge_oauth_client_id=os.getenv('LONGBRIDGE_OAUTH_CLIENT_ID') or None,
+            stock_index_remote_update_enabled=parse_env_bool(
+                os.getenv('STOCK_INDEX_REMOTE_UPDATE_ENABLED'),
+                default=True,
+            ),
             litellm_model=litellm_model,
             litellm_fallback_models=litellm_fallback_models,
             llm_temperature=resolve_unified_llm_temperature(litellm_model),
@@ -1490,6 +1518,13 @@ class Config:
                 os.getenv('AGENT_SKILL_ROUTING')
                 or os.getenv('AGENT_STRATEGY_ROUTING', 'auto')
             ).lower(),
+            agent_context_compression_enabled=parse_env_bool(
+                os.getenv('AGENT_CONTEXT_COMPRESSION_ENABLED'),
+                default=False,
+            ),
+            agent_context_compression_profile=agent_context_compression_profile,
+            agent_context_compression_trigger_tokens=agent_context_compression_trigger_tokens,
+            agent_context_protected_turns=agent_context_protected_turns,
             agent_event_monitor_enabled=os.getenv('AGENT_EVENT_MONITOR_ENABLED', 'false').lower() == 'true',
             agent_event_monitor_interval_minutes=parse_env_int(
                 os.getenv('AGENT_EVENT_MONITOR_INTERVAL_MINUTES'),

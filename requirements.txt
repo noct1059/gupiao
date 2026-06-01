@@ -7,7 +7,7 @@ python-dotenv>=1.0.0        # 环境变量配置管理
 tenacity>=8.2.0             # 重试机制（指数退避）
 sqlalchemy>=2.0.0           # ORM数据库操作
 schedule>=1.2.0             # 定时任务调度
-exchange-calendars>=4.5.0   # 交易日历（A股/港股/美股，Issue #373）
+exchange-calendars>=4.13.0   # 交易日历；4.5.x 与 pandas 3 不兼容（Timedelta "T"）
 
 # 数据源依赖（多源策略，按优先级排序）
 efinance>=0.5.5             # Priority 0: 东方财富数据源（最高优先级）https://github.com/Micro-sheep/efinance
@@ -16,7 +16,7 @@ tushare>=1.4.0              # Priority 2: 挖地兔 Pro API
 pytdx>=1.72                 # Priority 2: 通达信行情服务器
 baostock>=0.8.0             # Priority 3: 证券宝数据
 yfinance>=0.2.0             # Priority 4: Yahoo Finance (Fallback)
-longbridge>=0.2.0           # Priority 5: 长桥 OpenAPI（美股/港股兜底）
+longbridge>=0.2.77           # Priority 5: 长桥 OpenAPI（美股/港股兜底；OAuth 路径运行时检测 SDK 能力）
 tickflow>=0.1.0            # TickFlow official SDK (Issue #632, market review enhancement)
 
 #飞书

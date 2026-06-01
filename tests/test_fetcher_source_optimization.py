@@ -65,9 +65,18 @@ class TestFetcherSourceOptimization(unittest.TestCase):
             longbridge_app_key="",
             longbridge_app_secret="",
             longbridge_access_token="",
+            longbridge_oauth_client_id="",
         )
 
-        with patch("data_provider.efinance_fetcher.EfinanceFetcher", return_value=_StubFetcher("EfinanceFetcher", 0)), patch(
+        with patch.dict(
+            "os.environ",
+            {
+                "LONGBRIDGE_OAUTH_CLIENT_ID": "",
+                "LONGBRIDGE_APP_KEY": "",
+                "LONGBRIDGE_APP_SECRET": "",
+                "LONGBRIDGE_ACCESS_TOKEN": "",
+            },
+        ), patch("data_provider.efinance_fetcher.EfinanceFetcher", return_value=_StubFetcher("EfinanceFetcher", 0)), patch(
             "data_provider.akshare_fetcher.AkshareFetcher",
             return_value=_StubFetcher("AkshareFetcher", 1),
         ), patch(
@@ -86,6 +95,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
             "data_provider.longbridge_fetcher.LongbridgeFetcher",
             return_value=_StubFetcher("LongbridgeFetcher", 5),
         ) as mock_longbridge:
+            mock_longbridge.has_configured_credentials.return_value = False
             manager = DataFetcherManager()
 
         self.assertEqual(
@@ -100,6 +110,41 @@ class TestFetcherSourceOptimization(unittest.TestCase):
         )
         mock_tushare.assert_not_called()
         mock_longbridge.assert_not_called()
+
+    @patch("src.config.get_config")
+    def test_manager_enables_longbridge_with_oauth_client_id(self, mock_get_config):
+        mock_get_config.return_value = SimpleNamespace(
+            tushare_token="",
+            longbridge_app_key="",
+            longbridge_app_secret="",
+            longbridge_access_token="",
+            longbridge_oauth_client_id="client-1",
+        )
+
+        with patch("data_provider.efinance_fetcher.EfinanceFetcher", return_value=_StubFetcher("EfinanceFetcher", 0)), patch(
+            "data_provider.akshare_fetcher.AkshareFetcher",
+            return_value=_StubFetcher("AkshareFetcher", 1),
+        ), patch(
+            "data_provider.pytdx_fetcher.PytdxFetcher",
+            return_value=_StubFetcher("PytdxFetcher", 2),
+        ), patch(
+            "data_provider.baostock_fetcher.BaostockFetcher",
+            return_value=_StubFetcher("BaostockFetcher", 3),
+        ), patch(
+            "data_provider.yfinance_fetcher.YfinanceFetcher",
+            return_value=_StubFetcher("YfinanceFetcher", 4),
+        ), patch(
+            "data_provider.tushare_fetcher.TushareFetcher",
+            return_value=_StubFetcher("TushareFetcher", -1),
+        ), patch(
+            "data_provider.longbridge_fetcher.LongbridgeFetcher",
+            return_value=_StubFetcher("LongbridgeFetcher", 5),
+        ) as mock_longbridge:
+            mock_longbridge.has_configured_credentials.return_value = True
+            manager = DataFetcherManager()
+
+        self.assertIn("LongbridgeFetcher", manager.available_fetchers)
+        mock_longbridge.assert_called_once()
 
     @patch("src.config.get_config")
     def test_us_realtime_route_skips_temporarily_unavailable_longbridge(self, mock_get_config):

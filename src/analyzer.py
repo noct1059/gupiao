@@ -22,7 +22,11 @@ import litellm
 from json_repair import repair_json
 from litellm import Router
 
-from src.agent.llm_adapter import get_thinking_extra_body
+from src.agent.llm_adapter import (
+    get_thinking_extra_body,
+    resolve_fallback_litellm_wire_models,
+    register_fallback_model_pricing,
+)
 from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH
 from src.config import (
     Config,
@@ -31,8 +35,11 @@ from src.config import (
     get_config,
     get_configured_llm_models,
     normalize_litellm_temperature,
+    resolve_litellm_wire_model,
     resolve_news_window_days,
 )
+from src.llm.generation_params import apply_litellm_generation_params
+from src.llm.errors import call_litellm_with_param_recovery
 from src.storage import persist_llm_usage
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.report_language import (
@@ -40,13 +47,16 @@ from src.report_language import (
     get_no_data_text,
     get_placeholder_text,
     get_unknown_text,
+    get_chip_unavailable_text,
     infer_decision_type_from_advice,
+    is_chip_placeholder_value,
     localize_chip_health,
     localize_confidence_level,
     normalize_report_language,
 )
 from src.schemas.report_schema import AnalysisReportSchema
 from src.market_context import get_market_role, get_market_guidelines
+from src.market_phase_prompt import format_market_phase_prompt_section
 
 logger = logging.getLogger(__name__)
 
@@ -244,12 +254,7 @@ _CHIP_KEYS: tuple = ("profit_ratio", "avg_cost", "concentration", "chip_health")
 
 def _is_value_placeholder(v: Any) -> bool:
     """True if value is empty or placeholder (N/A, 数据缺失, etc.)."""
-    if v is None:
-        return True
-    if isinstance(v, (int, float)) and v == 0:
-        return True
-    s = str(v).strip().lower()
-    return s in ("", "n/a", "na", "数据缺失", "未知", "data unavailable", "unknown", "tbd")
+    return is_chip_placeholder_value(v)
 
 
 _RISK_WARNING_PLACEHOLDER_TEXTS = {
@@ -341,6 +346,20 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(str(v).strip())
     except (TypeError, ValueError):
         return default
+
+
+def _coerce_chip_metric(v: Any) -> Optional[float]:
+    """Convert chip metrics while preserving the distinction between missing and zero."""
+    if v is None:
+        return None
+    try:
+        numeric = float(v)
+    except (TypeError, ValueError):
+        try:
+            numeric = float(str(v).strip())
+        except (TypeError, ValueError):
+            return None
+    return None if math.isnan(numeric) else numeric
 
 
 _BULLISH_TREND_HINTS: Tuple[str, ...] = (
@@ -599,9 +618,56 @@ def _build_chip_structure_from_data(chip_data: Any, language: str = "zh") -> Dic
     }
 
 
+def _has_meaningful_chip_data(chip_data: Any) -> bool:
+    """Return True when chip data has the core metrics required for reporting."""
+    if not chip_data:
+        return False
+    if hasattr(chip_data, "avg_cost"):
+        avg_cost = _coerce_chip_metric(getattr(chip_data, "avg_cost", None))
+        concentration_90 = _coerce_chip_metric(getattr(chip_data, "concentration_90", None))
+        concentration_70 = _coerce_chip_metric(getattr(chip_data, "concentration_70", None))
+    else:
+        d = chip_data if isinstance(chip_data, dict) else {}
+        avg_cost = _coerce_chip_metric(d.get("avg_cost"))
+        concentration_90_value = d.get("concentration_90")
+        if concentration_90_value is None:
+            concentration_90_value = d.get("concentration")
+        concentration_90 = _coerce_chip_metric(concentration_90_value)
+        concentration_70 = _coerce_chip_metric(d.get("concentration_70"))
+    return (
+        avg_cost is not None
+        and avg_cost > 0
+        and (
+            (concentration_90 is not None and concentration_90 >= 0)
+            or (concentration_70 is not None and concentration_70 >= 0)
+        )
+    )
+
+
+def _mark_chip_structure_unavailable(result: "AnalysisResult", language: str) -> None:
+    if not result or not isinstance(result.dashboard, dict):
+        return
+    data_perspective = result.dashboard.get("data_perspective")
+    if not isinstance(data_perspective, dict):
+        return
+    data_perspective["chip_structure"] = {}
+    data_perspective["chip_unavailable_reason"] = get_chip_unavailable_text(language)
+
+
+def normalize_chip_structure_availability(result: "AnalysisResult", chip_data: Any) -> None:
+    """Fill valid chip metrics or collapse placeholder-only chip fields to one fallback line."""
+    if not result:
+        return
+    language = getattr(result, "report_language", "zh")
+    if _has_meaningful_chip_data(chip_data):
+        fill_chip_structure_if_needed(result, chip_data)
+        return
+    _mark_chip_structure_unavailable(result, language)
+
+
 def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> None:
     """When chip_data exists, fill chip_structure placeholder fields from chip_data (in-place)."""
-    if not result or not chip_data:
+    if not result or not _has_meaningful_chip_data(chip_data):
         return
     try:
         if not result.dashboard:
@@ -1355,6 +1421,9 @@ class AnalysisResult:
     # ========== 历史对比（Report Engine P0）==========
     query_id: Optional[str] = None  # 本次分析 query_id，用于历史对比时排除本次记录
 
+    # ========== 基本面上下文（仅运行时，用于通知拼装；不持久化到 to_dict）==========
+    fundamental_context: Optional[Dict[str, Any]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
@@ -1810,6 +1879,7 @@ class GeminiAnalyzer:
         self._use_legacy_default_prompt_override = use_legacy_default_prompt
         self._resolved_prompt_state: Optional[Dict[str, Any]] = None
         self._router = None
+        self._legacy_router_model_list: List[Dict[str, Any]] = []
         self._litellm_available = False
         self._init_litellm()
         if not self._litellm_available:
@@ -1908,6 +1978,47 @@ class GeminiAnalyzer:
             e.get('model_name', '').startswith('__legacy_') for e in config.llm_model_list
         )
 
+    @staticmethod
+    def _legacy_router_provider_alias(model: str) -> str:
+        provider = model.split("/", 1)[0] if "/" in model else "openai"
+        return f"__legacy_{provider}__"
+
+    @staticmethod
+    def _build_legacy_router_model_list_from_config(
+        model: str,
+        model_list: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Build legacy-router candidates from configured legacy llm_model_list entries."""
+        if not model:
+            return []
+        target_model = model
+        target_legacy_alias = GeminiAnalyzer._legacy_router_provider_alias(model)
+        legacy_entries: List[Dict[str, Any]] = []
+        for entry in model_list or []:
+            if not isinstance(entry, dict):
+                continue
+            model_name = str(entry.get("model_name") or "").strip()
+            if model_name != target_legacy_alias:
+                continue
+
+            params = entry.get("litellm_params")
+            if not isinstance(params, dict):
+                continue
+
+            api_key = str(params.get("api_key") or "").strip()
+            if not api_key or len(api_key) < 8:
+                continue
+
+            deployed_params = dict(params)
+            deployed_params["model"] = target_model
+            deployed_params["api_key"] = api_key
+            legacy_entries.append({
+                "model_name": target_model,
+                "litellm_params": deployed_params,
+            })
+
+        return legacy_entries
+
     def _init_litellm(self) -> None:
         """Initialize litellm Router from channels / YAML / legacy keys."""
         config = self._get_runtime_config()
@@ -1921,27 +2032,34 @@ class GeminiAnalyzer:
         # --- Channel / YAML path: build Router from pre-built model_list ---
         if self._has_channel_config(config):
             model_list = config.llm_model_list
-            self._router = Router(
-                model_list=model_list,
-                routing_strategy="simple-shuffle",
-                num_retries=2,
-            )
-            unique_models = list(dict.fromkeys(
-                e['litellm_params']['model'] for e in model_list
-            ))
-            logger.info(
-                f"Analyzer LLM: Router initialized from channels/YAML — "
-                f"{len(model_list)} deployment(s), models: {unique_models}"
-            )
-            return
+            try:
+                self._router = Router(
+                    model_list=model_list,
+                    routing_strategy="simple-shuffle",
+                    num_retries=2,
+                )
+            except TypeError:
+                logger.debug("Analyzer LLM: Router constructor signature not compatible; fallback to direct mode")
+                self._router = None
+            else:
+                unique_models = list(dict.fromkeys(
+                    e['litellm_params']['model'] for e in model_list
+                ))
+                logger.info(
+                    f"Analyzer LLM: Router initialized from channels/YAML — "
+                    f"{len(model_list)} deployment(s), models: {unique_models}"
+                )
+                return
 
         # --- Legacy path: build Router for multi-key, or use single key ---
         keys = get_api_keys_for_model(litellm_model, config)
-
-        if len(keys) > 1:
-            # Build legacy Router for primary model multi-key load-balancing
+        legacy_model_list = self._build_legacy_router_model_list_from_config(
+            litellm_model,
+            config.llm_model_list,
+        )
+        if len(legacy_model_list) <= 1 and keys:
             extra_params = extra_litellm_params(litellm_model, config)
-            legacy_model_list = [
+            configured_model_list = [
                 {
                     "model_name": litellm_model,
                     "litellm_params": {
@@ -1952,16 +2070,30 @@ class GeminiAnalyzer:
                 }
                 for k in keys
             ]
-            self._router = Router(
-                model_list=legacy_model_list,
-                routing_strategy="simple-shuffle",
-                num_retries=2,
-            )
-            logger.info(
-                f"Analyzer LLM: Legacy Router initialized with {len(keys)} keys "
-                f"for {litellm_model}"
-            )
-        elif keys:
+            if not legacy_model_list:
+                legacy_model_list = configured_model_list
+            elif len(legacy_model_list) < len(configured_model_list):
+                legacy_model_list = configured_model_list
+
+        if len(legacy_model_list) > 1:
+            self._legacy_router_model_list = legacy_model_list
+            try:
+                self._router = Router(
+                    model_list=legacy_model_list,
+                    routing_strategy="simple-shuffle",
+                    num_retries=2,
+                )
+            except TypeError:
+                logger.debug("Analyzer LLM: Legacy Router constructor signature not compatible; using legacy model_list fallback")
+                self._router = None
+            else:
+                logger.info(
+                    f"Analyzer LLM: Legacy Router initialized with {len(legacy_model_list)} keys "
+                    f"for {litellm_model}"
+                )
+                return
+
+        if keys:
             logger.info(f"Analyzer LLM: litellm initialized (model={litellm_model})")
         else:
             logger.info(
@@ -1983,6 +2115,8 @@ class GeminiAnalyzer:
         router_model_names: set[str],
     ) -> Any:
         """Dispatch a LiteLLM completion through router or direct fallback."""
+        wire_models = resolve_fallback_litellm_wire_models(model, config.llm_model_list)
+        register_fallback_model_pricing(wire_models)
         effective_kwargs = dict(call_kwargs)
         if use_channel_router and self._router and model in router_model_names:
             return self._router.completion(**effective_kwargs)
@@ -2206,6 +2340,11 @@ class GeminiAnalyzer:
         effective_system_prompt = system_prompt or self.TEXT_SYSTEM_PROMPT
         router_model_names = set(get_configured_llm_models(config.llm_model_list))
         for model in models_to_try:
+            recovery_model_list = config.llm_model_list
+            legacy_router_model_list = getattr(self, "_legacy_router_model_list", None) or []
+            if legacy_router_model_list and model == config.litellm_model and not use_channel_router:
+                recovery_model_list = legacy_router_model_list
+
             try:
                 model_short = model.split("/")[-1] if "/" in model else model
                 extra = get_thinking_extra_body(model_short)
@@ -2215,28 +2354,50 @@ class GeminiAnalyzer:
                         {"role": "system", "content": effective_system_prompt},
                         {"role": "user", "content": prompt},
                     ],
-                    "temperature": normalize_litellm_temperature(
-                        model,
-                        requested_temperature,
-                        model_list=config.llm_model_list,
-                        request_overrides={"extra_body": extra} if extra else None,
-                    ),
                     "max_tokens": max_tokens,
                 }
                 if extra:
                     call_kwargs["extra_body"] = extra
+                uses_router = (
+                    (use_channel_router and self._router and model in router_model_names)
+                    or (self._router and model == config.litellm_model and not use_channel_router)
+                )
+                if not uses_router:
+                    try:
+                        keys = get_api_keys_for_model(model, config)
+                    except AttributeError:
+                        keys = []
+                    if keys:
+                        call_kwargs["api_key"] = keys[0]
+                    try:
+                        call_kwargs.update(extra_litellm_params(model, config))
+                    except AttributeError:
+                        pass
+                call_kwargs = apply_litellm_generation_params(
+                    call_kwargs,
+                    model,
+                    requested_temperature,
+                    model_list=recovery_model_list,
+                )
 
                 _stream_text: Optional[str] = None
                 _stream_usage: Dict[str, Any] = {}
 
                 if stream:
                     try:
-                        stream_response = self._dispatch_litellm_completion(
-                            model,
-                            {**call_kwargs, "stream": True},
-                            config=config,
-                            use_channel_router=use_channel_router,
-                            router_model_names=router_model_names,
+                        stream_response = call_litellm_with_param_recovery(
+                            lambda kwargs: self._dispatch_litellm_completion(
+                                model,
+                                kwargs,
+                                config=config,
+                                use_channel_router=use_channel_router,
+                                router_model_names=router_model_names,
+                            ),
+                            model=model,
+                            call_kwargs={**call_kwargs, "stream": True},
+                            model_list=recovery_model_list,
+                            cache_recovery=False,
+                            logger=logger,
                         )
                         _stream_text, _stream_usage = self._consume_litellm_stream(
                             stream_response,
@@ -2272,12 +2433,18 @@ class GeminiAnalyzer:
                         response_validator(_stream_text)
                     return _stream_text, model, _stream_usage
 
-                response = self._dispatch_litellm_completion(
-                    model,
-                    call_kwargs,
-                    config=config,
-                    use_channel_router=use_channel_router,
-                    router_model_names=router_model_names,
+                response = call_litellm_with_param_recovery(
+                    lambda kwargs: self._dispatch_litellm_completion(
+                        model,
+                        kwargs,
+                        config=config,
+                        use_channel_router=use_channel_router,
+                        router_model_names=router_model_names,
+                    ),
+                    model=model,
+                    call_kwargs=call_kwargs,
+                    model_list=recovery_model_list,
+                    logger=logger,
                 )
 
                 content = self._extract_completion_text(response)
@@ -2343,6 +2510,7 @@ class GeminiAnalyzer:
         news_context: Optional[str] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         stream_progress_callback: Optional[Callable[[int], None]] = None,
+        analysis_context_pack_summary: Optional[str] = None,
     ) -> AnalysisResult:
         """
         分析单只股票
@@ -2409,7 +2577,13 @@ class GeminiAnalyzer:
         
         try:
             # 格式化输入（包含技术面数据和新闻）
-            prompt = self._format_prompt(context, name, news_context, report_language=report_language)
+            prompt = self._format_prompt(
+                context,
+                name,
+                news_context,
+                report_language=report_language,
+                analysis_context_pack_summary=analysis_context_pack_summary,
+            )
             
             config = self._get_runtime_config()
             model_name = config.litellm_model or "unknown"
@@ -2482,6 +2656,7 @@ class GeminiAnalyzer:
                 result.market_snapshot = self._build_market_snapshot(context)
                 result.model_used = model_used
                 result.report_language = report_language
+                normalize_chip_structure_availability(result, context.get("chip"))
 
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:
@@ -2544,6 +2719,7 @@ class GeminiAnalyzer:
         name: str,
         news_context: Optional[str] = None,
         report_language: str = "zh",
+        analysis_context_pack_summary: Optional[str] = None,
     ) -> str:
         """
         格式化分析提示词（决策仪表盘 v2.0）
@@ -2579,6 +2755,14 @@ class GeminiAnalyzer:
 | 分析日期 | {context.get('date', unknown_text)} |
 
 ---
+"""
+        prompt += format_market_phase_prompt_section(
+            context.get("market_phase_context"),
+            report_language=report_language,
+        )
+        if isinstance(analysis_context_pack_summary, str) and analysis_context_pack_summary:
+            prompt += analysis_context_pack_summary
+        prompt += """
 
 ## 📈 技术面数据
 
@@ -2730,6 +2914,19 @@ class GeminiAnalyzer:
 | 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
 | 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
 | 筹码状态 | {chip.get('chip_status', unknown_text)} | |
+"""
+        else:
+            chip_unavailable_text = get_chip_unavailable_text(report_language)
+            chip_instruction = (
+                "Do not fabricate profit ratio, average cost, or concentration. Mention chip data "
+                "unavailability only once in the report; do not repeat per-field no-data text in `chip_structure`."
+                if report_language == "en"
+                else "请勿编造获利比例、平均成本或集中度；报告中只说明一次筹码数据不可用，不要把“数据缺失，无法判断”逐字段重复写入 `chip_structure`。"
+            )
+            prompt += f"""
+### 筹码分布数据（效率指标）
+> {chip_unavailable_text}
+> {chip_instruction}
 """
         
         # 添加趋势分析结果（仅隐式内建 bull_trend 默认回退保留旧口径）

@@ -37,7 +37,14 @@ class TelegramSender:
         """检查 Telegram 配置是否完整"""
         return bool(self._telegram_config['bot_token'] and self._telegram_config['chat_id'])
    
-    def send_to_telegram(self, content: str, *, timeout_seconds: Optional[float] = None) -> bool:
+    def send_to_telegram(
+        self,
+        content: str,
+        *,
+        chat_id: Optional[str] = None,
+        message_thread_id: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
         """
         推送消息到 Telegram 机器人
         
@@ -55,13 +62,20 @@ class TelegramSender:
         Returns:
             是否发送成功
         """
-        if not self._is_telegram_configured():
+        target_chat_id = chat_id if chat_id is not None else self._telegram_config.get("chat_id")
+        target_message_thread_id = (
+            message_thread_id
+            if message_thread_id is not None
+            else self._telegram_config.get("message_thread_id")
+        )
+
+        if not (self._telegram_config["bot_token"] and target_chat_id):
             logger.warning("Telegram 配置不完整，跳过推送")
             return False
-        
+
         bot_token = self._telegram_config['bot_token']
-        chat_id = self._telegram_config['chat_id']
-        message_thread_id = self._telegram_config.get('message_thread_id')
+        chat_id = target_chat_id
+        message_thread_id = target_message_thread_id
         
         try:
             # Telegram API 端点
