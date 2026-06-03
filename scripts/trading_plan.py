@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
@@ -429,35 +429,161 @@ def collect_akshare_snapshot(mode: PlanMode, stock_list: Any = "") -> str:
     return "\n".join(blocks)
 
 
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        value = int((os.getenv(name) or "").strip() or default)
+    except ValueError:
+        value = default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _parse_news_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(BEIJING_TZ) if value.tzinfo else value.replace(tzinfo=BEIJING_TZ)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    now = datetime.now(BEIJING_TZ)
+    lowered = text.lower()
+    if any(token in text for token in ("刚刚", "分钟前", "小时前", "今天", "今日")) or lowered in {"today", "just now"}:
+        return now
+    if "昨天" in text or lowered == "yesterday":
+        return now - timedelta(days=1)
+    if "前天" in text:
+        return now - timedelta(days=2)
+
+    relative_patterns = (
+        (r"(\d+)\s*天前", 1),
+        (r"(\d+)\s*周前", 7),
+        (r"(\d+)\s*个月前", 30),
+        (r"(\d+)\s*days?\s+ago", 1),
+        (r"(\d+)\s*weeks?\s+ago", 7),
+        (r"(\d+)\s*months?\s+ago", 30),
+    )
+    for pattern, multiplier in relative_patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            return now - timedelta(days=int(match.group(1)) * multiplier)
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        return parsed.astimezone(BEIJING_TZ) if parsed.tzinfo else parsed.replace(tzinfo=BEIJING_TZ)
+    except ValueError:
+        pass
+
+    date_match = re.search(r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})", text)
+    if date_match:
+        year, month, day = (int(part) for part in date_match.groups())
+        try:
+            return datetime(year, month, day, tzinfo=BEIJING_TZ)
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_news_title(title: str) -> str:
+    compact = re.sub(r"[\s　|｜:：,，.。!！?？\-—_（）()\[\]【】]+", "", (title or "").lower())
+    compact = re.sub(r"\b(?:sh|sz)?\d{6}\b", "", compact)
+    return compact[:120]
+
+
+def _news_item_is_recent(item: Any, max_age_days: int) -> bool:
+    published = _parse_news_datetime(getattr(item, "published_date", ""))
+    if published is None:
+        return True
+    now = datetime.now(BEIJING_TZ)
+    if published > now + timedelta(days=1):
+        return False
+    return published >= now - timedelta(days=max_age_days)
+
+
+def _unique_recent_news(
+    results: Iterable[Any],
+    seen: set[str],
+    *,
+    max_age_days: int,
+    limit: int,
+) -> list[Any]:
+    selected: list[Any] = []
+    for item in results:
+        title = str(getattr(item, "title", "") or "").strip()
+        if not title or not _news_item_is_recent(item, max_age_days):
+            continue
+
+        key = _normalize_news_title(title)
+        url_key = str(getattr(item, "url", "") or "").split("?", 1)[0].strip().lower()
+        dedupe_key = url_key or key
+        if not key or dedupe_key in seen or key in seen:
+            continue
+
+        seen.add(dedupe_key)
+        seen.add(key)
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def build_search_context(mode: PlanMode, search_service: Any) -> str:
     if not search_service or not search_service.is_available:
         return "搜索服务不可用。"
 
+    max_age_days = _env_int(
+        "TRADING_PLAN_NEWS_MAX_AGE_DAYS",
+        _env_int("NEWS_MAX_AGE_DAYS", 1, minimum=1, maximum=7),
+        minimum=1,
+        maximum=7,
+    )
+    search_days = _env_int("TRADING_PLAN_SEARCH_DAYS", max_age_days, minimum=1, maximum=7)
+    max_results = _env_int("TRADING_PLAN_SEARCH_MAX_RESULTS", 8, minimum=3, maximum=12)
+    per_query_limit = _env_int("TRADING_PLAN_SEARCH_PER_QUERY_LIMIT", 4, minimum=1, maximum=8)
+    total_limit = _env_int("TRADING_PLAN_SEARCH_TOTAL_LIMIT", 16, minimum=4, maximum=30)
+
     queries = [
-        "A股 今日 盘面 热点 板块 资金流向",
-        "A股 今日 涨停 跌停 连板 热点 题材",
-        "A股 今日 政策 消息 产业 催化",
+        "A股 今日 盘面 热点 板块 资金流向 涨停 跌停",
+        "A股 今日 政策 消息 产业 催化 题材",
         "今日 上证指数 深证成指 创业板指 成交额 涨跌家数",
     ]
     if mode.key == "pre-market":
-        queries.extend(
-            [
-                "A股 今日 盘前 外围市场 人民币 商品 政策",
-                "隔夜 美股 港股 A50 人民币 原油 黄金 对A股影响",
-            ]
-        )
+        queries.append("A股 今日 盘前 外围市场 A50 人民币 商品 政策")
     elif mode.key in {"midday", "afternoon"}:
         queries.append("A股 盘中 主力资金 热门股票 板块异动")
     else:
         queries.append("A股 收盘 复盘 主线 板块 资金")
 
-    blocks: list[str] = []
+    seen: set[str] = set()
+    total_selected = 0
+    blocks: list[str] = [
+        (
+            "### 新闻筛选规则\n"
+            f"- 时间窗口：最近 {max_age_days} 天；重复标题/链接已合并；缺少日期的结果只作辅助参考。\n"
+            f"- 检索控制：{len(queries)} 组查询，每组最多展示 {per_query_limit} 条，总展示不超过 {total_limit} 条。"
+        )
+    ]
     for query in queries:
         try:
-            response = search_service.search(query, max_results=5, days=2)
+            response = search_service.search(query, max_results=max_results, days=search_days)
             lines = [f"### 搜索：{query}"]
             if response.success and response.results:
-                for idx, item in enumerate(response.results[:5], 1):
+                remaining = max(total_limit - total_selected, 0)
+                selected = _unique_recent_news(
+                    response.results,
+                    seen,
+                    max_age_days=max_age_days,
+                    limit=min(per_query_limit, remaining),
+                )
+                total_selected += len(selected)
+                if not selected:
+                    lines.append("无近期去重结果")
+                for idx, item in enumerate(selected, 1):
                     title = getattr(item, "title", "")
                     snippet = getattr(item, "snippet", "")
                     source = getattr(item, "source", "")
@@ -468,6 +594,8 @@ def build_search_context(mode: PlanMode, search_service: Any) -> str:
             blocks.append("\n".join(lines))
         except Exception as exc:
             blocks.append(f"### 搜索：{query}\n获取失败：{exc}")
+        if total_selected >= total_limit:
+            break
     return "\n\n".join(blocks)
 
 
@@ -476,7 +604,13 @@ def build_prompt(mode: PlanMode, stock_list: str, market_data: str, search_conte
     weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     weekday = weekday_names[now.weekday()]
     trading_day_note = "非交易日，盘面数据可能来自最近一个交易日" if now.weekday() >= 5 else "交易日"
-    common_rules = """
+    news_max_age_days = _env_int(
+        "TRADING_PLAN_NEWS_MAX_AGE_DAYS",
+        _env_int("NEWS_MAX_AGE_DAYS", 1, minimum=1, maximum=7),
+        minimum=1,
+        maximum=7,
+    )
+    common_rules = f"""
 你是一个偏交易计划型的 A 股复盘助手。请严格遵守：
 1. 不给绝对买卖建议，不说必涨必跌，不鼓励追高。
 2. 所有判断必须绑定数据、新闻、资金或盘面现象。
@@ -486,6 +620,7 @@ def build_prompt(mode: PlanMode, stock_list: str, market_data: str, search_conte
 6. 优先使用“核心指数快照、全市场温度、行业资金流向、热门板块、涨停池、成交额前列股票”这些硬数据。
 7. 非交易日或数据源失败时，要区分“市场本身无交易”和“接口获取失败”，不要把缺失数据当成利空。
 8. 严禁编造日期、指数点位、成交额、涨停数量、新闻事件；没有数据就写缺失。
+9. 新闻/资讯只把最近 {news_max_age_days} 天的结果当作今日催化；重复标题合并理解；几周前旧新闻只能当背景，不能当作今日盘面原因。
 """
 
     mode_instructions = {
