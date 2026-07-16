@@ -51,6 +51,8 @@ Requirements:
 """
             if report_language == "en":
                 return prompt + "\nAlways answer in English.\n"
+            if report_language == "ko":
+                return prompt + "\n항상 한국어로 답변하세요.\n"
             return prompt + "\n默认使用中文回答。\n"
 
         skills = ""
@@ -107,6 +109,28 @@ Important: ``decision_type`` must stay within the existing enum
 ``buy|hold|sell``. Express stronger conviction via ``confidence_level``,
 ``sentiment_score``, and the natural-language fields instead of inventing
 new decision_type values.
+
+The nested ``dashboard`` object must include ``phase_decision`` with these
+keys: ``phase_context``, ``action_window``, ``immediate_action``,
+``watch_conditions``, ``next_check_time``, ``confidence_reason``,
+``data_limitations``. For intraday/lunch-break/near-close phases, describe the
+current action, watch conditions, and next check point. For pre-market,
+non-trading, or unknown phases, do not invent today's intraday movement. If
+quote, daily bars, or technical data is stale, fallback, missing, fetch_failed,
+partial, or estimated, ``confidence_level`` must not be High/高 and the
+limitation must be reflected in ``confidence_reason`` or ``data_limitations``.
+
+The nested ``dashboard`` object should include optional ``signal_attribution`` when
+the available evidence supports attribution, with these keys: ``technical_indicators``, ``news_sentiment``, ``fundamentals``,
+``market_conditions``, ``strongest_bullish_signal``, ``strongest_bearish_signal``.
+The first four keys are contribution weights (0-100). Non-zero valid weights
+should sum to 100; all-zero means no effective signal and must not be faked.
+``technical_indicators`` explains the impact of technical signals on the recommendation.
+``news_sentiment`` explains the impact of news/sentiment on the recommendation.
+``fundamentals`` explains the impact of fundamental factors (valuation, earnings, financials) on the recommendation.
+``market_conditions`` explains the impact of overall market environment on the recommendation.
+``strongest_bullish_signal`` is the name of the strongest bullish signal (e.g., MACD golden cross, earnings surprise, low valuation).
+``strongest_bearish_signal`` is the name of the strongest bearish signal (e.g., MA death cross, earnings warning, high valuation).
 """
         if report_language == "en":
             return prompt + """
@@ -115,6 +139,14 @@ new decision_type values.
 - Keep every JSON key unchanged.
 - `decision_type` must remain `buy|hold|sell`.
 - Write all human-readable JSON values in English.
+"""
+        if report_language == "ko":
+            return prompt + """
+
+## Output Language
+- Keep every JSON key unchanged.
+- `decision_type` must remain `buy|hold|sell`.
+- Write all human-readable JSON values in Korean (한국어).
 """
         return prompt + """
 
@@ -161,6 +193,12 @@ new decision_type values.
             parts.append("## Risk Flags")
             for rf in ctx.risk_flags:
                 parts.append(f"- [{rf.get('severity', 'medium')}] {rf.get('category', '')}: {rf.get('description', '')}")
+            parts.append("")
+
+        disagreement_summary = ctx.meta.get("agent_disagreement_summary")
+        if isinstance(disagreement_summary, dict) and disagreement_summary:
+            parts.append("## Agent Disagreement Summary")
+            parts.append(json.dumps(disagreement_summary, ensure_ascii=False, default=str))
             parts.append("")
 
         # Skill meta
